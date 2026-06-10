@@ -54,7 +54,6 @@ class MainActivity: FlutterActivity() {
     
     private fun launchBankApp(accountNumber: String, packageName: String, result: MethodChannel.Result) {
         try {
-            // Check if the bank app is installed
             val packageManager = packageManager
             try {
                 packageManager.getPackageInfo(packageName, 0)
@@ -63,22 +62,12 @@ class MainActivity: FlutterActivity() {
                 return
             }
             
-            // Check if accessibility service is enabled
             if (!isAccessibilityServiceEnabled()) {
                 result.error("ACCESSIBILITY_NOT_ENABLED", "Accessibility service is not enabled", null)
                 return
             }
             
-            // Set up the pending operation for the accessibility service
-            BanksnapAccessibilityService.setPendingOperation(accountNumber, packageName) { success ->
-                runOnUiThread {
-                    if (success) {
-                        result.success(true)
-                    } else {
-                        result.error("FILL_FAILED", "Failed to auto-fill account number", null)
-                    }
-                }
-            }
+            val bankName = getBankNameFromPackage(packageName)
             
             // Launch the bank app
             val intent = packageManager.getLaunchIntentForPackage(packageName)
@@ -86,21 +75,34 @@ class MainActivity: FlutterActivity() {
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                 startActivity(intent)
                 
-                // Set a timeout for the operation
+                // Start the floating bubble service
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    if (BanksnapAccessibilityService.isServiceRunning) {
-                        // Check if operation is still pending
-                        // If still pending after timeout, consider it failed
-                        result.error("TIMEOUT", "Operation timed out", null)
-                    }
-                }, 15000) // 15 second timeout
+                    FloatingBubbleService.startService(this, accountNumber, packageName, bankName)
+                }, 500)
                 
+                result.success(true)
             } else {
                 result.error("LAUNCH_FAILED", "Could not launch bank app", null)
             }
             
         } catch (e: Exception) {
             result.error("LAUNCH_ERROR", "Error launching bank app: ${e.message}", null)
+        }
+    }
+    
+    private fun getBankNameFromPackage(packageName: String): String {
+        return when (packageName) {
+            "com.gtbank.main" -> "GTBank"
+            "com.accessbank.accessmobile" -> "Access Bank"
+            "com.zenith.bank" -> "Zenith Bank"
+            "ng.com.firstmobilebusiness.android" -> "First Bank"
+            "com.uba.mobile" -> "UBA"
+            "team.opay.pay" -> "Opay"
+            "com.kudabank.app" -> "Kuda"
+            "com.palmpay.app" -> "PalmPay"
+            "com.teamapt.monnify" -> "Moniepoint"
+            "com.sterlingbankmobileapp" -> "Sterling Bank"
+            else -> "Bank App"
         }
     }
     

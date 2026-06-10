@@ -18,6 +18,9 @@ class BanksnapAccessibilityService : AccessibilityService() {
         private const val RETRY_DELAY_MS = 300L
         private const val FIELD_FILL_TIMEOUT_MS = 15000L
 
+        var instance: BanksnapAccessibilityService? = null
+            private set
+
         private val BANK_APP_CONFIGS = mapOf(
             "com.gtbank.main" to BankConfig(
                 packageName = "com.gtbank.main",
@@ -116,6 +119,7 @@ class BanksnapAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        instance = this
         isServiceRunning = true
         Log.d(TAG, "Accessibility Service Connected")
 
