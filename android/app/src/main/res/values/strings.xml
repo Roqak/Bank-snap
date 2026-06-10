@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BankSnap</string>
+    <string name="accessibility_service_description">
+        BankSnap uses this accessibility service to automatically fill account numbers into your bank app transfer fields. 
+        This service only activates when you explicitly choose to launch a bank app from BankSnap, and only interacts with the account number input field. 
+        No personal data is collected or transmitted outside your device.
+    </string>
+</resources>
