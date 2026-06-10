@@ -1,23 +1,23 @@
 package com.banksnap.banksnap
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 
@@ -25,9 +25,8 @@ class FloatingBubbleService : android.app.Service() {
 
     companion object {
         private const val TAG = "BankSnapBubble"
-        private const val MAX_RETRY_ATTEMPTS = 40
-        private const val RETRY_DELAY_MS = 250L
-        private const val FIELD_FILL_TIMEOUT_MS = 20000L
+        private const val SCAN_INTERVAL_MS = 500L
+        private const val MAX_SCAN_ATTEMPTS = 60
 
         var isRunning = false
             private set
@@ -40,14 +39,14 @@ class FloatingBubbleService : android.app.Service() {
             currentAccountNumber = accountNumber
             currentBankPackage = bankPackage
             currentBankName = bankName
-            val intent = Intent(context, FloatingBubbleService::class.java).apply {
+            val intent = android.content.Intent(context, FloatingBubbleService::class.java).apply {
                 action = "START"
             }
             context.startService(intent)
         }
 
         fun stopService(context: android.content.Context) {
-            val intent = Intent(context, FloatingBubbleService::class.java).apply {
+            val intent = android.content.Intent(context, FloatingBubbleService::class.java).apply {
                 action = "STOP"
             }
             context.startService(intent)
@@ -61,23 +60,30 @@ class FloatingBubbleService : android.app.Service() {
     private var initialY = 0
     private var initialTouchX = 0f
     private var initialTouchY = 0f
-    private var retryCount = 0
+    private var scanCount = 0
     private val handler = Handler(Looper.getMainLooper())
-    private var timeoutRunnable: Runnable? = null
+    private var isExpanded = false
+    private var currentScreenState = ScreenState.UNKNOWN
+    private var lastFilledField: String? = null
 
-    override fun onBind(intent: Intent?): android.os.IBinder? = null
+    private enum class ScreenState {
+        UNKNOWN, LOGIN, DASHBOARD, TRANSFER_MENU, ACCOUNT_ENTRY,
+        AMOUNT_ENTRY, CONFIRMATION, PIN_ENTRY, SUCCESS, ERROR
+    }
+
+    override fun onBind(intent: android.content.Intent?): android.os.IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "FloatingBubbleService created")
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: android.content.Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             "START" -> {
                 if (!isRunning) {
                     showBubble()
-                    startMonitoringBankApp()
+                    startSmartMonitoring()
                 }
             }
             "STOP" -> {
@@ -89,7 +95,6 @@ class FloatingBubbleService : android.app.Service() {
 
     private fun showBubble() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-
         val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
         bubbleView = inflater.inflate(R.layout.floating_bubble, null)
 
@@ -102,8 +107,8 @@ class FloatingBubbleService : android.app.Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 50
-            y = 200
+            x = 20
+            y = 150
         }
 
         windowManager?.addView(bubbleView, params)
@@ -115,7 +120,6 @@ class FloatingBubbleService : android.app.Service() {
 
     private fun setupBubbleInteractions() {
         bubbleView?.let { view ->
-            // Make draggable
             view.setOnTouchListener { v, event ->
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
@@ -132,7 +136,6 @@ class FloatingBubbleService : android.app.Service() {
                         true
                     }
                     MotionEvent.ACTION_UP -> {
-                        // Check if it was a click (small movement)
                         val dx = event.rawX - initialTouchX
                         val dy = event.rawY - initialTouchY
                         if (dx * dx + dy * dy < 100) {
@@ -143,213 +146,328 @@ class FloatingBubbleService : android.app.Service() {
                     else -> false
                 }
             }
+
+            view.findViewById<ImageView>(R.id.btn_close)?.setOnClickListener {
+                stopSelf()
+            }
+
+            view.findViewById<Button>(R.id.btn_quick_1000)?.setOnClickListener {
+                attemptSmartFill("1000", "amount")
+            }
+            view.findViewById<Button>(R.id.btn_quick_2000)?.setOnClickListener {
+                attemptSmartFill("2000", "amount")
+            }
+            view.findViewById<Button>(R.id.btn_quick_5000)?.setOnClickListener {
+                attemptSmartFill("5000", "amount")
+            }
+            view.findViewById<Button>(R.id.btn_quick_10000)?.setOnClickListener {
+                attemptSmartFill("10000", "amount")
+            }
+            view.findViewById<Button>(R.id.btn_other)?.setOnClickListener {
+                showToast("Please enter amount manually in the bank app")
+            }
+            view.findViewById<Button>(R.id.btn_done)?.setOnClickListener {
+                showToast("Please enter your PIN manually. BankSnap cannot access PIN fields for security.")
+                updateBubbleStatus("PIN required - enter manually", ScreenState.PIN_ENTRY)
+            }
+            view.findViewById<Button>(R.id.btn_recheck)?.setOnClickListener {
+                scanCount = 0
+                showToast("Rechecking screen...")
+            }
         }
     }
 
     private fun toggleExpandedView() {
         bubbleView?.let { view ->
             val expandedView = view.findViewById<LinearLayout>(R.id.expanded_view)
-            val isVisible = expandedView.visibility == View.VISIBLE
-            expandedView.visibility = if (isVisible) View.GONE else View.VISIBLE
+            isExpanded = expandedView.visibility != View.VISIBLE
+            expandedView.visibility = if (isExpanded) View.VISIBLE else View.GONE
+            if (isExpanded) {
+                view.findViewById<ImageView>(R.id.bubble_icon)?.animate()?.rotation(180f)?.setDuration(200)?.start()
+            } else {
+                view.findViewById<ImageView>(R.id.bubble_icon)?.animate()?.rotation(0f)?.setDuration(200)?.start()
+            }
         }
     }
 
     private fun updateBubbleUI() {
         bubbleView?.let { view ->
-            val bankNameText = view.findViewById<TextView>(R.id.bubble_bank_name)
-            val accountText = view.findViewById<TextView>(R.id.bubble_account)
+            view.findViewById<TextView>(R.id.bubble_bank_name)?.text = currentBankName ?: "Bank App"
+            view.findViewById<TextView>(R.id.bubble_account)?.text = currentAccountNumber ?: ""
+            updateBubbleStatus("Analyzing screen...", ScreenState.UNKNOWN)
+        }
+    }
+
+    private fun updateBubbleStatus(message: String, state: ScreenState) {
+        bubbleView?.let { view ->
             val statusText = view.findViewById<TextView>(R.id.bubble_status)
+            val progressBar = view.findViewById<ProgressBar>(R.id.bubble_progress)
+            val statusIcon = view.findViewById<ImageView>(R.id.status_icon)
 
-            bankNameText?.text = currentBankName ?: "Bank App"
-            accountText?.text = currentAccountNumber ?: ""
-            statusText?.text = "Waiting for transfer screen..."
+            statusText?.text = message
+            progressBar?.visibility = if (state == ScreenState.UNKNOWN) View.VISIBLE else View.GONE
 
-            // Setup quick action buttons
-            view.findViewById<Button>(R.id.btn_1000)?.setOnClickListener {
-                attemptFillAmount("1000")
+            val iconRes = when (state) {
+                ScreenState.UNKNOWN -> android.R.drawable.ic_menu_search
+                ScreenState.LOGIN -> android.R.drawable.ic_lock_idle_lock
+                ScreenState.DASHBOARD -> android.R.drawable.ic_menu_search
+                ScreenState.TRANSFER_MENU -> android.R.drawable.ic_menu_send
+                ScreenState.ACCOUNT_ENTRY -> android.R.drawable.ic_menu_edit
+                ScreenState.AMOUNT_ENTRY -> android.R.drawable.ic_menu_agenda
+                ScreenState.CONFIRMATION -> android.R.drawable.ic_menu_info_details
+                ScreenState.PIN_ENTRY -> android.R.drawable.ic_lock_idle_lock
+                ScreenState.SUCCESS -> android.R.drawable.ic_menu_send
+                ScreenState.ERROR -> android.R.drawable.ic_dialog_alert
             }
-            view.findViewById<Button>(R.id.btn_2000)?.setOnClickListener {
-                attemptFillAmount("2000")
-            }
-            view.findViewById<Button>(R.id.btn_5000)?.setOnClickListener {
-                attemptFillAmount("5000")
-            }
-            view.findViewById<Button>(R.id.btn_10000)?.setOnClickListener {
-                attemptFillAmount("10000")
-            }
-            view.findViewById<Button>(R.id.btn_custom)?.setOnClickListener {
-                showCustomAmountDialog()
-            }
-            view.findViewById<Button>(R.id.btn_done)?.setOnClickListener {
-                showToast("Please enter your PIN manually. BankSnap cannot access PIN fields for security.")
-            }
-            view.findViewById<ImageView>(R.id.btn_close)?.setOnClickListener {
-                stopSelf()
+            statusIcon?.setImageResource(iconRes)
+
+            // Show/hide action buttons based on state
+            val amountButtons = view.findViewById<LinearLayout>(R.id.amount_buttons_container)
+            val actionButtons = view.findViewById<LinearLayout>(R.id.action_buttons_container)
+
+            when (state) {
+                ScreenState.ACCOUNT_ENTRY -> {
+                    amountButtons?.visibility = View.GONE
+                    actionButtons?.visibility = View.VISIBLE
+                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.GONE
+                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.GONE
+                }
+                ScreenState.AMOUNT_ENTRY -> {
+                    amountButtons?.visibility = View.VISIBLE
+                    actionButtons?.visibility = View.VISIBLE
+                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.GONE
+                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.VISIBLE
+                }
+                ScreenState.PIN_ENTRY -> {
+                    amountButtons?.visibility = View.GONE
+                    actionButtons?.visibility = View.VISIBLE
+                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.VISIBLE
+                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.GONE
+                }
+                else -> {
+                    amountButtons?.visibility = View.GONE
+                    actionButtons?.visibility = View.GONE
+                }
             }
         }
     }
 
-    private fun startMonitoringBankApp() {
-        val packageName = currentBankPackage ?: return
+    private fun startSmartMonitoring() {
         val accountNumber = currentAccountNumber ?: return
+        val packageName = currentBankPackage ?: return
 
-        // Start periodic scanning of the bank app UI
         handler.post(object : Runnable {
             override fun run() {
                 if (!isRunning) return
 
-                // Use AccessibilityService to get root node
+                if (scanCount >= MAX_SCAN_ATTEMPTS) {
+                    updateBubbleStatus("Scan limit reached. Tap Recheck to retry.", ScreenState.ERROR)
+                    return
+                }
+
                 val rootNode = BanksnapAccessibilityService.instance?.rootInActiveWindow
                 if (rootNode != null) {
                     val currentPackage = rootNode.packageName?.toString()
                     if (currentPackage == packageName) {
-                        handleBankAppScreen(rootNode, accountNumber)
+                        analyzeScreenAndAct(rootNode, accountNumber)
+                    } else {
+                        updateBubbleStatus("Waiting for $currentBankName to open...", ScreenState.UNKNOWN)
                     }
                 }
 
+                scanCount++
                 if (isRunning) {
-                    handler.postDelayed(this, RETRY_DELAY_MS)
+                    handler.postDelayed(this, SCAN_INTERVAL_MS)
                 }
             }
         })
     }
 
-    private fun handleBankAppScreen(rootNode: AccessibilityNodeInfo, accountNumber: String) {
-        bubbleView?.let { view ->
-            val statusText = view.findViewById<TextView>(R.id.bubble_status)
+    private fun analyzeScreenAndAct(rootNode: AccessibilityNodeInfo, accountNumber: String) {
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(rootNode, allNodes)
 
-            // Try to find and fill account number
-            val accountField = findAccountInputField(rootNode)
-            if (accountField != null) {
-                val filled = fillField(accountField, accountNumber)
-                if (filled) {
-                    statusText?.text = "Account filled! Enter amount below"
-                    view.findViewById<LinearLayout>(R.id.amount_buttons)?.visibility = View.VISIBLE
-                    return
+        val allTexts = allNodes.mapNotNull { it.text?.toString()?.lowercase() }
+        val allHints = allNodes.mapNotNull { it.hintText?.toString()?.lowercase() }
+        val allDescs = allNodes.mapNotNull { it.contentDescription?.toString()?.lowercase() }
+
+        // Determine screen state
+        val newState = determineScreenState(allTexts, allHints, allDescs, allNodes)
+
+        if (newState != currentScreenState) {
+            currentScreenState = newState
+            Log.d(TAG, "Screen state changed to: $newState")
+        }
+
+        when (currentScreenState) {
+            ScreenState.LOGIN -> {
+                updateBubbleStatus("Please log in to $currentBankName first", ScreenState.LOGIN)
+            }
+            ScreenState.DASHBOARD -> {
+                updateBubbleStatus("Tap 'Transfer' or 'Send Money' in the bank app", ScreenState.DASHBOARD)
+                // Try to auto-tap transfer button
+                val transferBtn = findTransferButton(rootNode)
+                if (transferBtn != null && scanCount < 5) {
+                    transferBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    showToast("Navigating to transfer screen...")
                 }
             }
-
-            // Check if we're on amount entry screen
-            val amountField = findAmountInputField(rootNode)
-            if (amountField != null) {
-                statusText?.text = "Account confirmed. Enter amount or use quick buttons"
-                view.findViewById<LinearLayout>(R.id.amount_buttons)?.visibility = View.VISIBLE
+            ScreenState.TRANSFER_MENU -> {
+                updateBubbleStatus("Select transfer type (e.g., 'To Bank Account')", ScreenState.TRANSFER_MENU)
             }
-
-            // Check if PIN field is present
-            val pinField = findPinInputField(rootNode)
-            if (pinField != null) {
-                statusText?.text = "PIN required. BankSnap cannot fill this. Please enter manually."
-                view.findViewById<LinearLayout>(R.id.amount_buttons)?.visibility = View.GONE
-                view.findViewById<Button>(R.id.btn_done)?.visibility = View.VISIBLE
+            ScreenState.ACCOUNT_ENTRY -> {
+                updateBubbleStatus("Account field detected. Auto-filling now...", ScreenState.ACCOUNT_ENTRY)
+                val accountField = findAccountInputField(allNodes)
+                if (accountField != null && lastFilledField != "account") {
+                    val filled = fillFieldSmart(accountField, accountNumber)
+                    if (filled) {
+                        lastFilledField = "account"
+                        updateBubbleStatus("Account filled! Enter amount below ↓", ScreenState.AMOUNT_ENTRY)
+                        vibrateSuccess()
+                        if (!isExpanded) toggleExpandedView()
+                    }
+                }
+            }
+            ScreenState.AMOUNT_ENTRY -> {
+                updateBubbleStatus("Account confirmed. Tap amount or enter manually", ScreenState.AMOUNT_ENTRY)
+            }
+            ScreenState.CONFIRMATION -> {
+                updateBubbleStatus("Review details and confirm transfer", ScreenState.CONFIRMATION)
+            }
+            ScreenState.PIN_ENTRY -> {
+                updateBubbleStatus("PIN required - BankSnap cannot fill this", ScreenState.PIN_ENTRY)
+                if (!isExpanded) toggleExpandedView()
+            }
+            ScreenState.SUCCESS -> {
+                updateBubbleStatus("Transfer complete!", ScreenState.SUCCESS)
+                showToast("Transfer completed successfully!")
+            }
+            ScreenState.ERROR -> {
+                updateBubbleStatus("Error detected. Check bank app.", ScreenState.ERROR)
+            }
+            ScreenState.UNKNOWN -> {
+                updateBubbleStatus("Analyzing screen... ($scanCount/$MAX_SCAN_ATTEMPTS)", ScreenState.UNKNOWN)
             }
         }
     }
 
-    private fun attemptFillAmount(amount: String) {
-        val rootNode = BanksnapAccessibilityService.instance?.rootInActiveWindow ?: return
-        val amountField = findAmountInputField(rootNode)
+    private fun determineScreenState(
+        texts: List<String>,
+        hints: List<String>,
+        descs: List<String>,
+        nodes: List<AccessibilityNodeInfo>
+    ): ScreenState {
+        val allContent = texts + hints + descs
 
+        // Check for PIN/OTP
+        if (allContent.any { it.contains("pin") || it.contains("otp") || it.contains("token") || it.contains("password") }) {
+            return ScreenState.PIN_ENTRY
+        }
+
+        // Check for success
+        if (allContent.any { it.contains("successful") || it.contains("completed") || it.contains("done") || it.contains("sent") }) {
+            return ScreenState.SUCCESS
+        }
+
+        // Check for error
+        if (allContent.any { it.contains("error") || it.contains("failed") || it.contains("invalid") || it.contains("unsuccessful") }) {
+            return ScreenState.ERROR
+        }
+
+        // Check for confirmation/review
+        if (allContent.any { it.contains("confirm") || it.contains("review") || it.contains("verify") || it.contains("summary") }) {
+            return ScreenState.CONFIRMATION
+        }
+
+        // Check for amount entry (account already present but amount empty)
+        val accountField = findAccountInputField(nodes)
+        val amountField = findAmountInputField(nodes)
         if (amountField != null) {
-            val filled = fillField(amountField, amount)
+            val amountText = amountField.text?.toString() ?: ""
+            val accountText = accountField?.text?.toString() ?: ""
+            if (accountText.isNotEmpty() && amountText.isEmpty()) {
+                return ScreenState.AMOUNT_ENTRY
+            }
+        }
+
+        // Check for account entry
+        val hasAccountField = nodes.any { node ->
+            val hint = node.hintText?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            hint.contains("account") || desc.contains("account") ||
+                    hint.contains("beneficiary") || desc.contains("beneficiary")
+        }
+        val editTexts = nodes.filter { it.className?.toString()?.contains("EditText") == true }
+        if (hasAccountField || (editTexts.isNotEmpty() && allContent.any { it.contains("account") })) {
+            return ScreenState.ACCOUNT_ENTRY
+        }
+
+        // Check for transfer menu
+        if (allContent.any { it.contains("transfer") || it.contains("send money") || it.contains("send funds") || it.contains("quick transfer") }) {
+            return ScreenState.TRANSFER_MENU
+        }
+
+        // Check for login
+        if (allContent.any { it.contains("login") || it.contains("sign in") || it.contains("welcome") || it.contains("password") } ||
+            nodes.any { it.className?.toString()?.contains("Password") == true }) {
+            return ScreenState.LOGIN
+        }
+
+        // Check for dashboard (has balance, home, etc.)
+        if (allContent.any { it.contains("balance") || it.contains("home") || it.contains("dashboard") || it.contains("welcome back") }) {
+            return ScreenState.DASHBOARD
+        }
+
+        return ScreenState.UNKNOWN
+    }
+
+    private fun attemptSmartFill(value: String, fieldType: String) {
+        val rootNode = BanksnapAccessibilityService.instance?.rootInActiveWindow ?: return
+
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(rootNode, allNodes)
+
+        val targetField = when (fieldType) {
+            "amount" -> findAmountInputField(allNodes)
+            "account" -> findAccountInputField(allNodes)
+            else -> null
+        }
+
+        if (targetField != null) {
+            val filled = fillFieldSmart(targetField, value)
             if (filled) {
-                showToast("Amount ₦$amount entered!")
-                bubbleView?.let { view ->
-                    view.findViewById<TextView>(R.id.bubble_status)?.text = "Amount ₦$amount entered. Review and confirm transfer."
-                }
+                vibrateSuccess()
+                showToast("₦$value entered!")
+                updateBubbleStatus("₦$value entered. Review and confirm transfer.", ScreenState.CONFIRMATION)
             } else {
-                showToast("Could not fill amount. Please enter manually.")
+                showToast("Could not fill. Please tap the field first, then try again.")
             }
         } else {
-            showToast("Amount field not found. Please tap the field first.")
+            showToast("$fieldType field not found. Please navigate to the correct screen.")
         }
     }
 
-    private fun showCustomAmountDialog() {
-        // For simplicity, show a toast suggesting manual entry
-        showToast("Custom amount: Please enter the amount manually in the bank app, then tap 'Done'")
-    }
+    private fun fillFieldSmart(node: AccessibilityNodeInfo, text: String): Boolean {
+        // Focus first
+        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
 
-    private fun findAccountInputField(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val allEditTexts = mutableListOf<AccessibilityNodeInfo>()
-        collectAllEditTexts(rootNode, allEditTexts)
-
-        val hints = listOf("account", "beneficiary", "recipient", "destination", "send to", "transfer to", "credit")
-
-        // Strategy 1: By hint/content description
-        for (editText in allEditTexts) {
-            val hint = editText.hintText?.toString()?.lowercase() ?: ""
-            val desc = editText.contentDescription?.toString()?.lowercase() ?: ""
-            val text = editText.text?.toString()?.lowercase() ?: ""
-
-            for (h in hints) {
-                if (hint.contains(h) || desc.contains(h) || text.contains(h)) {
-                    return editText
-                }
-            }
-        }
-
-        // Strategy 2: Only empty EditText
-        val emptyEditTexts = allEditTexts.filter { it.text.isNullOrEmpty() }
-        if (emptyEditTexts.size == 1) return emptyEditTexts.first()
-
-        // Strategy 3: First empty or first overall
-        return emptyEditTexts.firstOrNull() ?: allEditTexts.firstOrNull()
-    }
-
-    private fun findAmountInputField(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val allEditTexts = mutableListOf<AccessibilityNodeInfo>()
-        collectAllEditTexts(rootNode, allEditTexts)
-
-        val amountHints = listOf("amount", "sum", "value", "₦", "ngn", "naira")
-
-        for (editText in allEditTexts) {
-            val hint = editText.hintText?.toString()?.lowercase() ?: ""
-            val desc = editText.contentDescription?.toString()?.lowercase() ?: ""
-
-            for (h in amountHints) {
-                if (hint.contains(h) || desc.contains(h)) {
-                    return editText
-                }
-            }
-        }
-
-        // If account is already filled, the next empty field is likely amount
-        val emptyFields = allEditTexts.filter { it.text.isNullOrEmpty() }
-        return emptyFields.firstOrNull()
-    }
-
-    private fun findPinInputField(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        val allEditTexts = mutableListOf<AccessibilityNodeInfo>()
-        collectAllEditTexts(rootNode, allEditTexts)
-
-        val pinHints = listOf("pin", "password", "otp", "token", "secure", "authorize")
-
-        for (editText in allEditTexts) {
-            val hint = editText.hintText?.toString()?.lowercase() ?: ""
-            val desc = editText.contentDescription?.toString()?.lowercase() ?: ""
-
-            for (h in pinHints) {
-                if (hint.contains(h) || desc.contains(h)) {
-                    return editText
-                }
-            }
-        }
-        return null
-    }
-
-    private fun fillField(node: AccessibilityNodeInfo, text: String): Boolean {
+        // Try set text
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
         val result = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+
         if (result) {
             val current = node.text?.toString() ?: ""
-            return current == text || current.contains(text)
+            if (current == text || current.contains(text)) return true
         }
 
-        // Fallback: focus and type char by char
-        node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        // Fallback: clear and type
+        val clearArgs = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
+
         for (char in text) {
             val charArgs = Bundle().apply {
                 putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, char.toString())
@@ -361,14 +479,86 @@ class FloatingBubbleService : android.app.Service() {
         return finalText == text || finalText.contains(text)
     }
 
-    private fun collectAllEditTexts(node: AccessibilityNodeInfo, result: MutableList<AccessibilityNodeInfo>) {
-        if (node.className?.toString()?.contains("EditText") == true ||
-            node.className?.toString()?.contains("TextInput") == true) {
-            result.add(node)
+    private fun findAccountInputField(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
+        val hints = listOf("account", "beneficiary", "recipient", "destination", "send to", "transfer to", "credit")
+
+        // Strategy 1: By hint or description
+        for (node in nodes) {
+            val hint = node.hintText?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            val text = node.text?.toString()?.lowercase() ?: ""
+
+            for (h in hints) {
+                if (hint.contains(h) || desc.contains(h) || text.contains(h)) {
+                    if (node.className?.toString()?.contains("EditText") == true) return node
+                }
+            }
         }
+
+        // Strategy 2: First empty EditText
+        val editTexts = nodes.filter { it.className?.toString()?.contains("EditText") == true }
+        return editTexts.firstOrNull { it.text.isNullOrEmpty() } ?: editTexts.firstOrNull()
+    }
+
+    private fun findAmountInputField(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
+        val amountHints = listOf("amount", "sum", "value", "how much", "enter amount")
+
+        for (node in nodes) {
+            val hint = node.hintText?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+
+            for (h in amountHints) {
+                if (hint.contains(h) || desc.contains(h)) {
+                    if (node.className?.toString()?.contains("EditText") == true) return node
+                }
+            }
+        }
+
+        val editTexts = nodes.filter { it.className?.toString()?.contains("EditText") == true }
+        val nonAccountFields = editTexts.filter { node ->
+            val hint = node.hintText?.toString()?.lowercase() ?: ""
+            !hint.contains("account") && !hint.contains("beneficiary")
+        }
+        return nonAccountFields.firstOrNull { it.text.isNullOrEmpty() } ?: nonAccountFields.firstOrNull()
+    }
+
+    private fun findTransferButton(rootNode: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val allNodes = mutableListOf<AccessibilityNodeInfo>()
+        collectAllNodes(rootNode, allNodes)
+
+        val transferTexts = listOf("transfer", "send money", "send", "quick transfer", "to bank", "new transfer")
+
+        for (node in allNodes) {
+            if (!node.isClickable) continue
+            val text = node.text?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+
+            for (t in transferTexts) {
+                if (text == t || desc == t || text.contains(t) || desc.contains(t)) {
+                    return node
+                }
+            }
+        }
+        return null
+    }
+
+    private fun collectAllNodes(node: AccessibilityNodeInfo, result: MutableList<AccessibilityNodeInfo>) {
+        result.add(node)
         for (i in 0 until node.childCount) {
             node.getChild(i)?.let { child ->
-                collectAllEditTexts(child, result)
+                collectAllNodes(child, result)
+            }
+        }
+    }
+
+    private fun vibrateSuccess() {
+        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+        vibrator?.let {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                it.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                it.vibrate(100)
             }
         }
     }
@@ -385,6 +575,7 @@ class FloatingBubbleService : android.app.Service() {
         currentAccountNumber = null
         currentBankPackage = null
         currentBankName = null
+        lastFilledField = null
         if (bubbleView != null) {
             windowManager?.removeView(bubbleView)
             bubbleView = null
