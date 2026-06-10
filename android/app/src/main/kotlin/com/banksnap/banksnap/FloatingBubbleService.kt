@@ -1,7 +1,12 @@
 package com.banksnap.banksnap
 
 import android.accessibilityservice.AccessibilityService
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Intent
 import android.graphics.PixelFormat
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -20,6 +25,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
 
 class FloatingBubbleService : android.app.Service() {
 
@@ -27,6 +33,8 @@ class FloatingBubbleService : android.app.Service() {
         private const val TAG = "BankSnapBubble"
         private const val SCAN_INTERVAL_MS = 500L
         private const val MAX_SCAN_ATTEMPTS = 60
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "banksnap_bubble"
 
         var isRunning = false
             private set
@@ -39,14 +47,18 @@ class FloatingBubbleService : android.app.Service() {
             currentAccountNumber = accountNumber
             currentBankPackage = bankPackage
             currentBankName = bankName
-            val intent = android.content.Intent(context, FloatingBubbleService::class.java).apply {
+            val intent = Intent(context, FloatingBubbleService::class.java).apply {
                 action = "START"
             }
-            context.startService(intent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
 
         fun stopService(context: android.content.Context) {
-            val intent = android.content.Intent(context, FloatingBubbleService::class.java).apply {
+            val intent = Intent(context, FloatingBubbleService::class.java).apply {
                 action = "STOP"
             }
             context.startService(intent)
@@ -71,17 +83,18 @@ class FloatingBubbleService : android.app.Service() {
         AMOUNT_ENTRY, CONFIRMATION, PIN_ENTRY, SUCCESS, ERROR
     }
 
-    override fun onBind(intent: android.content.Intent?): android.os.IBinder? = null
+    override fun onBind(intent: Intent?): android.os.IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "FloatingBubbleService created")
     }
 
-    override fun onStartCommand(intent: android.content.Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             "START" -> {
                 if (!isRunning) {
+                    startForegroundServiceWithNotification()
                     showBubble()
                     startSmartMonitoring()
                 }
@@ -93,34 +106,89 @@ class FloatingBubbleService : android.app.Service() {
         return START_STICKY
     }
 
-    private fun showBubble() {
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
-        bubbleView = inflater.inflate(R.layout.floating_bubble, null)
+    private fun startForegroundServiceWithNotification() {
+        try {
+            val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
 
-        params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = 20
-            y = 150
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID,
+                    "BankSnap Assistant",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Keeps BankSnap active while you transfer"
+                    setShowBadge(false)
+                }
+                notificationManager.createNotificationChannel(channel)
+            }
+
+            val launchIntent = packageManager.getLaunchIntentForPackage(applicationContext.packageName)
+            val pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                launchIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+
+            val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setContentTitle("BankSnap Assistant")
+                .setContentText("Helping with ${currentBankName ?: "bank transfer"}")
+                .setSmallIcon(android.R.drawable.ic_menu_send)
+                .setContentIntent(pendingIntent)
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground: ${e.message}")
+            // Continue without foreground — the overlay will still work
         }
+    }
 
-        windowManager?.addView(bubbleView, params)
-        isRunning = true
+    private fun showBubble() {
+        try {
+            windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            val inflater = getSystemService(LAYOUT_INFLATER_SERVICE) as LayoutInflater
+            bubbleView = inflater.inflate(R.layout.floating_bubble, null)
 
-        setupBubbleInteractions()
-        updateBubbleUI()
+            params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                } else {
+                    @Suppress("DEPRECATION")
+                    WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+                },
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                x = 20
+                y = 150
+            }
+
+            windowManager?.addView(bubbleView, params)
+            isRunning = true
+
+            setupBubbleInteractions()
+            updateBubbleUI()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error showing bubble: ${e.message}")
+            showToast("Could not show bubble. Please allow 'Display over other apps' permission.")
+            stopSelf()
+        }
     }
 
     private fun setupBubbleInteractions() {
         bubbleView?.let { view ->
-            view.setOnTouchListener { v, event ->
+            view.setOnTouchListener { _, event ->
                 when (event.action) {
                     MotionEvent.ACTION_DOWN -> {
                         initialX = params!!.x
@@ -182,11 +250,6 @@ class FloatingBubbleService : android.app.Service() {
             val expandedView = view.findViewById<LinearLayout>(R.id.expanded_view)
             isExpanded = expandedView.visibility != View.VISIBLE
             expandedView.visibility = if (isExpanded) View.VISIBLE else View.GONE
-            if (isExpanded) {
-                view.findViewById<ImageView>(R.id.bubble_icon)?.animate()?.rotation(180f)?.setDuration(200)?.start()
-            } else {
-                view.findViewById<ImageView>(R.id.bubble_icon)?.animate()?.rotation(0f)?.setDuration(200)?.start()
-            }
         }
     }
 
@@ -206,6 +269,7 @@ class FloatingBubbleService : android.app.Service() {
 
             statusText?.text = message
             progressBar?.visibility = if (state == ScreenState.UNKNOWN) View.VISIBLE else View.GONE
+            statusIcon?.visibility = if (state == ScreenState.UNKNOWN) View.GONE else View.VISIBLE
 
             val iconRes = when (state) {
                 ScreenState.UNKNOWN -> android.R.drawable.ic_menu_search
@@ -221,28 +285,29 @@ class FloatingBubbleService : android.app.Service() {
             }
             statusIcon?.setImageResource(iconRes)
 
-            // Show/hide action buttons based on state
             val amountButtons = view.findViewById<LinearLayout>(R.id.amount_buttons_container)
             val actionButtons = view.findViewById<LinearLayout>(R.id.action_buttons_container)
+            val btnDone = view.findViewById<Button>(R.id.btn_done)
+            val btnOther = view.findViewById<Button>(R.id.btn_other)
 
             when (state) {
                 ScreenState.ACCOUNT_ENTRY -> {
                     amountButtons?.visibility = View.GONE
                     actionButtons?.visibility = View.VISIBLE
-                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.GONE
-                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.GONE
+                    btnDone?.visibility = View.GONE
+                    btnOther?.visibility = View.GONE
                 }
                 ScreenState.AMOUNT_ENTRY -> {
                     amountButtons?.visibility = View.VISIBLE
                     actionButtons?.visibility = View.VISIBLE
-                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.GONE
-                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.VISIBLE
+                    btnDone?.visibility = View.GONE
+                    btnOther?.visibility = View.VISIBLE
                 }
                 ScreenState.PIN_ENTRY -> {
                     amountButtons?.visibility = View.GONE
                     actionButtons?.visibility = View.VISIBLE
-                    view.findViewById<Button>(R.id.btn_done)?.visibility = View.VISIBLE
-                    view.findViewById<Button>(R.id.btn_other)?.visibility = View.GONE
+                    btnDone?.visibility = View.VISIBLE
+                    btnOther?.visibility = View.GONE
                 }
                 else -> {
                     amountButtons?.visibility = View.GONE
@@ -261,18 +326,22 @@ class FloatingBubbleService : android.app.Service() {
                 if (!isRunning) return
 
                 if (scanCount >= MAX_SCAN_ATTEMPTS) {
-                    updateBubbleStatus("Scan limit reached. Tap Recheck to retry.", ScreenState.ERROR)
+                    updateBubbleStatus("Scan limit reached. Tap Recheck.", ScreenState.ERROR)
                     return
                 }
 
-                val rootNode = BanksnapAccessibilityService.instance?.rootInActiveWindow
-                if (rootNode != null) {
-                    val currentPackage = rootNode.packageName?.toString()
-                    if (currentPackage == packageName) {
-                        analyzeScreenAndAct(rootNode, accountNumber)
-                    } else {
-                        updateBubbleStatus("Waiting for $currentBankName to open...", ScreenState.UNKNOWN)
+                try {
+                    val rootNode = BanksnapAccessibilityService.instance?.rootInActiveWindow
+                    if (rootNode != null) {
+                        val currentPackage = rootNode.packageName?.toString()
+                        if (currentPackage == packageName) {
+                            analyzeScreenAndAct(rootNode, accountNumber)
+                        } else {
+                            updateBubbleStatus("Waiting for ${currentBankName ?: "bank"}...", ScreenState.UNKNOWN)
+                        }
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error during screen scan: ${e.message}")
                 }
 
                 scanCount++
@@ -291,48 +360,46 @@ class FloatingBubbleService : android.app.Service() {
         val allHints = allNodes.mapNotNull { it.hintText?.toString()?.lowercase() }
         val allDescs = allNodes.mapNotNull { it.contentDescription?.toString()?.lowercase() }
 
-        // Determine screen state
         val newState = determineScreenState(allTexts, allHints, allDescs, allNodes)
 
         if (newState != currentScreenState) {
             currentScreenState = newState
-            Log.d(TAG, "Screen state changed to: $newState")
+            Log.d(TAG, "Screen state: $newState")
         }
 
         when (currentScreenState) {
             ScreenState.LOGIN -> {
-                updateBubbleStatus("Please log in to $currentBankName first", ScreenState.LOGIN)
+                updateBubbleStatus("Please log in to ${currentBankName ?: "bank"} first", ScreenState.LOGIN)
             }
             ScreenState.DASHBOARD -> {
-                updateBubbleStatus("Tap 'Transfer' or 'Send Money' in the bank app", ScreenState.DASHBOARD)
-                // Try to auto-tap transfer button
+                updateBubbleStatus("Tap 'Transfer' or I'll try to navigate", ScreenState.DASHBOARD)
                 val transferBtn = findTransferButton(rootNode)
                 if (transferBtn != null && scanCount < 5) {
                     transferBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    showToast("Navigating to transfer screen...")
+                    showToast("Navigating to transfer...")
                 }
             }
             ScreenState.TRANSFER_MENU -> {
-                updateBubbleStatus("Select transfer type (e.g., 'To Bank Account')", ScreenState.TRANSFER_MENU)
+                updateBubbleStatus("Select transfer type", ScreenState.TRANSFER_MENU)
             }
             ScreenState.ACCOUNT_ENTRY -> {
-                updateBubbleStatus("Account field detected. Auto-filling now...", ScreenState.ACCOUNT_ENTRY)
+                updateBubbleStatus("Filling account number...", ScreenState.ACCOUNT_ENTRY)
                 val accountField = findAccountInputField(allNodes)
                 if (accountField != null && lastFilledField != "account") {
                     val filled = fillFieldSmart(accountField, accountNumber)
                     if (filled) {
                         lastFilledField = "account"
-                        updateBubbleStatus("Account filled! Enter amount below ↓", ScreenState.AMOUNT_ENTRY)
+                        updateBubbleStatus("Account filled! Enter amount ↓", ScreenState.AMOUNT_ENTRY)
                         vibrateSuccess()
                         if (!isExpanded) toggleExpandedView()
                     }
                 }
             }
             ScreenState.AMOUNT_ENTRY -> {
-                updateBubbleStatus("Account confirmed. Tap amount or enter manually", ScreenState.AMOUNT_ENTRY)
+                updateBubbleStatus("Account confirmed. Tap amount below", ScreenState.AMOUNT_ENTRY)
             }
             ScreenState.CONFIRMATION -> {
-                updateBubbleStatus("Review details and confirm transfer", ScreenState.CONFIRMATION)
+                updateBubbleStatus("Review and confirm transfer", ScreenState.CONFIRMATION)
             }
             ScreenState.PIN_ENTRY -> {
                 updateBubbleStatus("PIN required - BankSnap cannot fill this", ScreenState.PIN_ENTRY)
@@ -340,13 +407,13 @@ class FloatingBubbleService : android.app.Service() {
             }
             ScreenState.SUCCESS -> {
                 updateBubbleStatus("Transfer complete!", ScreenState.SUCCESS)
-                showToast("Transfer completed successfully!")
+                showToast("Transfer completed!")
             }
             ScreenState.ERROR -> {
                 updateBubbleStatus("Error detected. Check bank app.", ScreenState.ERROR)
             }
             ScreenState.UNKNOWN -> {
-                updateBubbleStatus("Analyzing screen... ($scanCount/$MAX_SCAN_ATTEMPTS)", ScreenState.UNKNOWN)
+                updateBubbleStatus("Analyzing... (${scanCount}/${MAX_SCAN_ATTEMPTS})", ScreenState.UNKNOWN)
             }
         }
     }
@@ -359,27 +426,22 @@ class FloatingBubbleService : android.app.Service() {
     ): ScreenState {
         val allContent = texts + hints + descs
 
-        // Check for PIN/OTP
         if (allContent.any { it.contains("pin") || it.contains("otp") || it.contains("token") || it.contains("password") }) {
             return ScreenState.PIN_ENTRY
         }
 
-        // Check for success
         if (allContent.any { it.contains("successful") || it.contains("completed") || it.contains("done") || it.contains("sent") }) {
             return ScreenState.SUCCESS
         }
 
-        // Check for error
         if (allContent.any { it.contains("error") || it.contains("failed") || it.contains("invalid") || it.contains("unsuccessful") }) {
             return ScreenState.ERROR
         }
 
-        // Check for confirmation/review
         if (allContent.any { it.contains("confirm") || it.contains("review") || it.contains("verify") || it.contains("summary") }) {
             return ScreenState.CONFIRMATION
         }
 
-        // Check for amount entry (account already present but amount empty)
         val accountField = findAccountInputField(nodes)
         val amountField = findAmountInputField(nodes)
         if (amountField != null) {
@@ -390,7 +452,6 @@ class FloatingBubbleService : android.app.Service() {
             }
         }
 
-        // Check for account entry
         val hasAccountField = nodes.any { node ->
             val hint = node.hintText?.toString()?.lowercase() ?: ""
             val desc = node.contentDescription?.toString()?.lowercase() ?: ""
@@ -402,18 +463,15 @@ class FloatingBubbleService : android.app.Service() {
             return ScreenState.ACCOUNT_ENTRY
         }
 
-        // Check for transfer menu
         if (allContent.any { it.contains("transfer") || it.contains("send money") || it.contains("send funds") || it.contains("quick transfer") }) {
             return ScreenState.TRANSFER_MENU
         }
 
-        // Check for login
         if (allContent.any { it.contains("login") || it.contains("sign in") || it.contains("welcome") || it.contains("password") } ||
             nodes.any { it.className?.toString()?.contains("Password") == true }) {
             return ScreenState.LOGIN
         }
 
-        // Check for dashboard (has balance, home, etc.)
         if (allContent.any { it.contains("balance") || it.contains("home") || it.contains("dashboard") || it.contains("welcome back") }) {
             return ScreenState.DASHBOARD
         }
@@ -438,20 +496,18 @@ class FloatingBubbleService : android.app.Service() {
             if (filled) {
                 vibrateSuccess()
                 showToast("₦$value entered!")
-                updateBubbleStatus("₦$value entered. Review and confirm transfer.", ScreenState.CONFIRMATION)
+                updateBubbleStatus("₦$value entered. Review and confirm.", ScreenState.CONFIRMATION)
             } else {
-                showToast("Could not fill. Please tap the field first, then try again.")
+                showToast("Could not fill. Tap the field first, then try again.")
             }
         } else {
-            showToast("$fieldType field not found. Please navigate to the correct screen.")
+            showToast("$fieldType field not found. Navigate to correct screen.")
         }
     }
 
     private fun fillFieldSmart(node: AccessibilityNodeInfo, text: String): Boolean {
-        // Focus first
         node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
 
-        // Try set text
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
@@ -462,7 +518,6 @@ class FloatingBubbleService : android.app.Service() {
             if (current == text || current.contains(text)) return true
         }
 
-        // Fallback: clear and type
         val clearArgs = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
         }
@@ -482,7 +537,6 @@ class FloatingBubbleService : android.app.Service() {
     private fun findAccountInputField(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
         val hints = listOf("account", "beneficiary", "recipient", "destination", "send to", "transfer to", "credit")
 
-        // Strategy 1: By hint or description
         for (node in nodes) {
             val hint = node.hintText?.toString()?.lowercase() ?: ""
             val desc = node.contentDescription?.toString()?.lowercase() ?: ""
@@ -495,7 +549,6 @@ class FloatingBubbleService : android.app.Service() {
             }
         }
 
-        // Strategy 2: First empty EditText
         val editTexts = nodes.filter { it.className?.toString()?.contains("EditText") == true }
         return editTexts.firstOrNull { it.text.isNullOrEmpty() } ?: editTexts.firstOrNull()
     }
@@ -552,14 +605,18 @@ class FloatingBubbleService : android.app.Service() {
     }
 
     private fun vibrateSuccess() {
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
-        vibrator?.let {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                it.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else {
-                @Suppress("DEPRECATION")
-                it.vibrate(100)
+        try {
+            val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+            vibrator?.let {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    it.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    it.vibrate(100)
+                }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "Vibration failed: ${e.message}")
         }
     }
 
@@ -576,9 +633,13 @@ class FloatingBubbleService : android.app.Service() {
         currentBankPackage = null
         currentBankName = null
         lastFilledField = null
-        if (bubbleView != null) {
-            windowManager?.removeView(bubbleView)
-            bubbleView = null
+        try {
+            if (bubbleView != null) {
+                windowManager?.removeView(bubbleView)
+                bubbleView = null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error removing bubble: ${e.message}")
         }
         Log.d(TAG, "FloatingBubbleService destroyed")
     }
